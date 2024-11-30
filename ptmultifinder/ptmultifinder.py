@@ -33,6 +33,7 @@ from ptlibs import ptjsonlib, ptmisclib, ptprinthelper, ptnethelper, tldparser, 
 from ptlibs.threads import ptthreads, printlock
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse
 
 
 class PtMultiFinder:
@@ -41,27 +42,16 @@ class PtMultiFinder:
         self.ptthreads = ptthreads.PtThreads()
         self.headers   = ptnethelper.get_request_headers(args)
         self.use_json  = args.json
-        self.timeout   = args.timeout
+        self.timeout   = args.timeout if not args.proxy else None
         self.args      = args
         self.proxies   = {"http": args.proxy, "https": args.proxy}
-
-        try:
-            self.domains = ptmisclib.read_file(args.file)
-        except FileNotFoundError:
-            self.ptjsonlib.end_error(f"File '{args.file}' not found", self.use_json)
-
-        if len(self.domains) > 1 and self.use_json:
-            ptprinthelper.ptprint("Error: Cannot test more than 1 domain while --json parameter is present", "ERROR")
-            sys.exit(1)
-
+        self.sources   = self._get_sources(args.source)
+        self.domains   = self._get_domains(args.domains)
 
     def run(self, args):
-        self.sources = self.get_sources(args.source)
         ptprinthelper.ptprint("Testing domains:", "TITLE", not self.use_json, colortext=True)
-
         with ThreadPoolExecutor(max_workers=args.threads) as executor:
             future_to_domain = {executor.submit(self.check_domains, domain): domain for domain in self.domains}
-
             for future in as_completed(future_to_domain):
                 domain = future_to_domain[future]
                 try:
@@ -71,38 +61,78 @@ class PtMultiFinder:
 
     def check_domains(self, domain: str):
         """Threaded check domain method"""
-        if not re.match(r'^https?://', domain):
-            domain = 'https://' + domain
-
+        url = self._normalize_domain(domain)
         if self.args.check:
-            # Checks status code of non-existing resource
-            response = requests.get(f"{domain}/f00.b4r.n0t.f0und/", allow_redirects=False, timeout=self.timeout, proxies=self.proxies, verify=False, headers=self.headers)
-            if response.status_code == 200:
+            if self._check_status_of_non_existing_resource(url):
                 return
-
-        # Test URL for <sources>
         for file_path in self.sources:
-            full_url = f"{domain}/{file_path}"
-            try:
-                response = requests.get(full_url, allow_redirects=False, timeout=self.timeout, proxies=self.proxies, verify=False, headers=self.headers)
-                if not response:
-                    return
+            full_url = f"{url}/{file_path}"
+            ptprinthelper.ptprint(f"{full_url}", "ADDITIONS", not self.use_json, end="\r", flush=True, colortext=True, clear_to_eol=True)
+            self._test_url_and_handle_redirects(full_url)
 
-                if response.status_code in self.args.status_code:
-                    if self.proxies and "burp" in response.text.lower():
-                        return
-                    if self.args.string_yes:
-                        if any(string in response.text for string in self.args.string_yes):
-                            ptprinthelper.ptprint(f"String-Yes: {full_url}", "TEXT", not self.use_json, colortext=True, flush=True)
-                    elif self.args.string_no:
-                        if not all([self.args.string_no]) in response.text:
-                            ptprinthelper.ptprint(f"String-No: {full_url}", "TEXT", not self.use_json, colortext=True, flush=True)
-                    else:
-                        ptprinthelper.ptprint(f"{domain}/{file_path}", "TEXT", not self.use_json, colortext=True, flush=True)
-            except Exception as e:
+    def _test_url_and_handle_redirects(self, url: str):
+        """Test the URL and process redirects if necessary."""
+        try:
+            response = requests.get(url, allow_redirects=False, timeout=self.timeout, proxies=self.proxies, verify=False, headers=self.headers)
+            return self._test_response(response, url)
+        except Exception as e:
+            return False
+
+    def _normalize_domain(self, domain: str) -> str:
+        """Ensure the domain has an HTTPS scheme."""
+        if not re.match(r'^https?://', domain):
+            return 'https://' + domain
+        return domain
+
+    def _check_status_of_non_existing_resource(self, url: str) -> bool:
+        """Check a non-existing resource to see if the domain is responding as expected."""
+        try:
+            response = requests.get(f"{url}/f00B4rN0tF0und", allow_redirects=False, timeout=self.timeout, proxies=self.proxies, verify=False, headers=self.headers)
+            """
+            if response.status_code in (301, 302):
+                redirect_url = response.headers.get('Location')
+                if redirect_url and self._is_same_domain(domain, redirect_url):
+                    # Follow the redirect and re-check the status of the non-existing resource
+                    response = requests.get(f"{redirect_url}/f00.b4r.n0t.f0und/", allow_redirects=False, timeout=self.timeout, proxies=self.proxies, verify=False, headers=self.headers)
+            # Return True if the status code is 200, indicating it's not responding as expected
+            """
+            if response.status_code in (200, 301, 302):#, 301, 302):)
+                return True
+        except Exception as e:
+            return True
+
+        return False
+
+    def _is_same_domain_redirect(self, original_url: str, redirect_url: str) -> bool:
+        """Check if the redirect URL is within the same domain."""
+        if not redirect_url:
+            return
+        original_netloc = urlparse(original_url).netloc
+        redirected_netloc = urlparse(redirect_url).netloc
+        return original_netloc.split('.')[-2:] == redirected_netloc.split('.')[-2:]
+
+    def _get_base_domain(self, url: str) -> str:
+        """Extract the base domain from a URL (including scheme but excluding path)."""
+        parsed_url = urlparse(url)
+        return f"{parsed_url.scheme}://{parsed_url.netloc}"
+
+    def _test_response(self, response, url: str):
+        """Process and print the response based on the specified criteria."""
+        if response.status_code in self.args.status_code:
+            if "window.location=" in response.text.lower():
+                return
+            if self.proxies and "burp" in response.text.lower():
                 return
 
-    def get_sources(self, sources: List[str]):
+            if self.args.string_yes and any(string in response.text for string in self.args.string_yes):
+                ptprinthelper.ptprint(f"String-Yes: {url}", "TEXT", not self.use_json, colortext=True, flush=True, clear_to_eol=True)
+            elif self.args.string_no and not all([self.args.string_no]) in response.text:
+                ptprinthelper.ptprint(f"String-No: {url}", "TEXT", not self.use_json, colortext=True, flush=True, clear_to_eol=True)
+            else:
+                ptprinthelper.ptprint(url, "TEXT", not self.use_json, colortext=True, flush=True, clear_to_eol=True)
+            return True
+
+    def _get_sources(self, sources: List[str]):
         """Process sources (file to test)"""
         if len(sources) == 1 and os.path.exists(sources[0]): # Process sources from file
             with open(os.path.abspath(sources[0]), "r") as source_file:
@@ -110,25 +140,43 @@ class PtMultiFinder:
         else: # Process sources from CLI
             return [source for source in sources]
 
+    def _get_domains(self, domain_file):
+        try:
+            domains = ptmisclib.read_file(domain_file)
+            if len(domains) > 1 and self.use_json:
+                self.ptjsonlib.end_error(f"Cannot test more than 1 domain while --json parameter is present", self.use_json)
+            return domains
+        except FileNotFoundError:
+            self.ptjsonlib.end_error(f"File '{domain_file}' not found", self.use_json)
+
+    def _get_domains(self, domains: List[str]):
+        """Process domains (from file or list)"""
+        if len(domains) == 1 and os.path.exists(domains[0]): # Load domains from file
+            with open(os.path.abspath(domains[0]), "r") as domain_file:
+                loaded_domains = [line.strip() for line in domain_file.readlines()]
+            return loaded_domains
+        else:  # Process domains from list
+            return domains
+
 def get_help():
     return [
         {"usage": ["ptmultifinder <options>"]},
         {"usage_example": [
-            "ptmultifinder -f domains.txt -s sources.txt",
-            "ptmultifinder -f domains.txt -s admin.php .git/ backup/"
+            "ptmultifinder --domains domains.txt --sources sources.txt",
+            "ptmultifinder --domains domains.txt --sources admin.php .git/ backup/"
         ]},
         {"options": [
-            ["-f",       "--file",         "<file>",                        "Specify file with list of domains to test"],
-            ["-s",       "--source",       "<source>",                      "Specify file with list of sources to check for (index.php, admin/, .git/HEAD, .svn/entries)"],
+            ["-d",       "--domains",      "<domains>",                     "Domains or file with domains to test"],
+            ["-s",       "--source",       "<source>",                      "Sources or file with sources to check"],
             ["-sc",      "--status-code",  "<status-code>",                 "Specify status codes that will be accepted (default 200)"],
             ["-sy",      "--string-yes",   "<string-yes>",                  "Show domain only if it contains specified strings"],
             ["-sn",      "--string-no",    "<string-no>",                   "Show domain only if it does not contain specified strings"],
             ["-ch",      "--check",        "",                              "Skip domain if it responds with a status code of 200 to a non-existent resource."],
-            ["-p",       "--proxy",        "<proxy>",                       "Set proxy (e.g. http://127.0.0.1:8080)"],
+            ["-p",       "--proxy",        "<proxy>",                       "Set Proxy"],
             ["-a",       "--user-agent",   "<agent>",                       "Set User-Agent"],
-            ["-t",       "--threads",      "<threads>",                     "Set threads count"],
-            ["-T",       "--timeout",      "<timeout>",                     "Set timeout (default 5s)"],
-            ["-H",       "--headers",      "<header:value>",                "Set custom header(s)"],
+            ["-t",       "--threads",      "<threads>",                     "Set Threads count"],
+            ["-T",       "--timeout",      "<timeout>",                     "Set Timeout (default 5s)"],
+            ["-H",       "--headers",      "<header:value>",                "Set custom headers"],
             ["-v",       "--version",      "",                              "Show script version and exit"],
             ["-h",       "--help",         "",                              "Show this help message and exit"],
             ["-j",       "--json",         "",                              "Output in JSON format"],
@@ -138,8 +186,8 @@ def get_help():
 
 def parse_args():
     parser = argparse.ArgumentParser(add_help=False, usage=f"{SCRIPTNAME} <options>")
-    parser.add_argument("-f",  "--file",        type=str)
-    parser.add_argument("-s",  "--source",      type=str, nargs="+")
+    parser.add_argument("-d",  "--domains",     type=str, nargs="+", required=True)
+    parser.add_argument("-s",  "--source",      type=str, nargs="+", required=True)
     parser.add_argument("-sc", "--status-code", type=int, nargs="*", default=[200])
     parser.add_argument("-sy", "--string-yes",  type=str, nargs="+")
     parser.add_argument("-sn", "--string-no",   type=str, nargs="+")
