@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 """
-    Copyright (c) 2024 Penterep Security s.r.o.
+    Copyright (c) 2025 Penterep Security s.r.o.
 
     ptmultifinder is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -50,6 +50,7 @@ class PtMultiFinder:
 
     def run(self, args):
         ptprinthelper.ptprint("Testing domains:", "TITLE", not self.use_json, colortext=True)
+
         with ThreadPoolExecutor(max_workers=args.threads) as executor:
             future_to_domain = {executor.submit(self.check_domains, domain): domain for domain in self.domains}
             for future in as_completed(future_to_domain):
@@ -67,13 +68,14 @@ class PtMultiFinder:
                 return
         for file_path in self.sources:
             full_url = f"{url}/{file_path}"
-            ptprinthelper.ptprint(f"{full_url}", "ADDITIONS", not self.use_json, end="\r", flush=True, colortext=True, clear_to_eol=True)
+            ptprinthelper.ptprint(f"{full_url}", "ADDITIONS", not self.use_json, end="\r", flush=True, colortext=True, clear_to_eol=True) # Current tested URL
             self._test_url_and_handle_redirects(full_url)
 
     def _test_url_and_handle_redirects(self, url: str):
         """Test the URL and process redirects if necessary."""
         try:
-            response = requests.get(url, allow_redirects=False, timeout=self.timeout, proxies=self.proxies, verify=False, headers=self.headers)
+            #response = requests.get(url, allow_redirects=False, timeout=self.timeout, proxies=self.proxies, verify=False, headers=self.headers)
+            response = requests.get(url, allow_redirects=True, timeout=self.timeout, proxies=self.proxies, verify=False, headers=self.headers)
             return self._test_response(response, url)
         except Exception as e:
             return False
@@ -126,9 +128,11 @@ class PtMultiFinder:
 
             if self.args.string_yes and any(string in response.text for string in self.args.string_yes):
                 ptprinthelper.ptprint(f"String-Yes: {url}", "TEXT", not self.use_json, colortext=True, flush=True, clear_to_eol=True)
-            elif self.args.string_no and not all([self.args.string_no]) in response.text:
+
+            if self.args.string_no and not all([self.args.string_no]) in response.text:
                 ptprinthelper.ptprint(f"String-No: {url}", "TEXT", not self.use_json, colortext=True, flush=True, clear_to_eol=True)
-            else:
+
+            if not self.args.string_yes and not self.args.string_no:
                 ptprinthelper.ptprint(url, "TEXT", not self.use_json, colortext=True, flush=True, clear_to_eol=True)
             return True
 
@@ -169,8 +173,8 @@ def get_help():
             ["-d",       "--domains",      "<domains>",                     "Domains or file with domains to test"],
             ["-s",       "--source",       "<source>",                      "Sources or file with sources to check"],
             ["-sc",      "--status-code",  "<status-code>",                 "Specify status codes that will be accepted (default 200)"],
-            ["-sy",      "--string-yes",   "<string-yes>",                  "Show domain only if it contains specified strings"],
-            ["-sn",      "--string-no",    "<string-no>",                   "Show domain only if it does not contain specified strings"],
+            ["-sy",      "--string-yes",   "<string>",                      "Show only results that contain the specified string in the response"],
+            ["-sn",      "--string-no",    "<string>",                      "Show only results that do not contain the specific string in the response"],
             ["-ch",      "--check",        "",                              "Skip domain if it responds with a status code of 200 to a non-existent resource."],
             ["-p",       "--proxy",        "<proxy>",                       "Set Proxy"],
             ["-a",       "--user-agent",   "<agent>",                       "Set User-Agent"],
